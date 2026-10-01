@@ -1126,8 +1126,19 @@ namespace MouseWithoutBorders.Class
             }
         }
 
-        private void StartNewTcpClientThread(string machineName, IPAddress ip)
+        private const int ReconnectInitialDelayMs = 500;
+        private const int ReconnectMaxDelayMs = 30000;
+
+        private void StartNewTcpClientThread(string machineName, IPAddress ip, int retryDelayMs = 0)
         {
+            void ScheduleReconnect(int delayMs)
+            {
+                if (Common.Sk == this)
+                {
+                    StartNewTcpClientThread(machineName, ip, delayMs);
+                }
+            }
+
             void NewTcpClient()
             {
                 // SuppressFlow fixes an issue on service mode, where the helper process can't get enough permissions to be started again.
@@ -1135,6 +1146,18 @@ namespace MouseWithoutBorders.Class
                 using var asyncFlowControl = ExecutionContext.SuppressFlow();
 
                 TcpClient tcpClient = null;
+
+                if (retryDelayMs > 0)
+                {
+                    Thread.Sleep(retryDelayMs);
+
+                    if (Common.Sk != this)
+                    {
+                        return;
+                    }
+                }
+
+                int nextDelayMs = retryDelayMs > 0 ? Math.Min(retryDelayMs * 2, ReconnectMaxDelayMs) : ReconnectInitialDelayMs;
 
                 try
                 {
@@ -1161,6 +1184,7 @@ namespace MouseWithoutBorders.Class
                     Logger.LogDebug(string.Format(CultureInfo.CurrentCulture, "=====> Connecting to: {0}:{1}", machineName, ip.ToString()));
 
                     long timeoutLeft;
+                    int connectBackoffMs = ReconnectInitialDelayMs;
 
                     do
                     {
@@ -1181,7 +1205,8 @@ namespace MouseWithoutBorders.Class
                             if (timeoutLeft > 0)
                             {
                                 Logger.LogDebug($"tcpClient.Connect: {timeoutLeft}: {e.Message}");
-                                Thread.Sleep(1000);
+                                Thread.Sleep(connectBackoffMs);
+                                connectBackoffMs = Math.Min(connectBackoffMs * 2, ReconnectMaxDelayMs);
                                 continue;
                             }
                             else
@@ -1190,9 +1215,13 @@ namespace MouseWithoutBorders.Class
 
                                 string message = $"Connection timed out: {machineName}:{ip}";
 
-                                Common.ShowToolTip(message, 5000, ToolTipIcon.Warning, Setting.Values.ShowClipNetStatus);
+                                if (retryDelayMs == 0)
+                                {
+                                    Common.ShowToolTip(message, 5000, ToolTipIcon.Warning, Setting.Values.ShowClipNetStatus);
+                                }
 
                                 UpdateTcpSockets(tcp, SocketStatus.Timeout);
+                                ScheduleReconnect(nextDelayMs);
                                 return;
                             }
                         }
@@ -1205,6 +1234,9 @@ namespace MouseWithoutBorders.Class
 
                     // Sending/Receiving packages
                     MainTCPRoutine(tcp, machineName, true);
+
+                    // Connection dropped or errored out.
+                    ScheduleReconnect(ReconnectInitialDelayMs);
                 }
                 catch (ObjectDisposedException e)
                 {
